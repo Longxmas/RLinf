@@ -23,7 +23,11 @@ Design (rollout-side swap):
     ``denoise_inds``, tokenized prompts) so the actor consumes them unchanged.
 
 Sampling (SDE loop owned by the vvla engine, this class is format glue):
-  * the denoise loop is ``vvla.rollout.logprob.flow_sample_with_logprob``; the
+  * the denoise loop is vvla's CUDA-graph ``SdeLoopGraph`` (whole N-step loop
+    captured once per batch size, replayed per call; the selected SDE step is
+    a coefficient-buffer update, not a re-capture), falling back to the eager
+    ``vvla.rollout.logprob.flow_sample_with_logprob`` python loop on CPU or
+    with ``vvla.use_cuda_graph: false``; either way the
     adapter passes a per-timestep ``sigma(t)`` callable that reproduces openpi's
     flow-SDE noise schedule ``sigma(t) = noise_level * sqrt(t / (1 - t))``
     (with openpi's t==1 endpoint clamp, see :func:`_openpi_flow_sde_sigma`) at
@@ -401,6 +405,16 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
             self.config.value_after_vlm and self.config.add_value_head
         )
 
+        # ---- CUDA-graph SDE loop (vvla engine) --------------------------------
+        # The whole N-step denoise loop is captured once per (batch, num_steps)
+        # and replayed per rollout call (vvla SdeLoopGraph): the selected SDE
+        # step only changes per-step coefficient buffers, not the graph. Weight
+        # sync stays valid because both RLinf syncers update parameters
+        # in-place (copy_), preserving the tensors the capture recorded.
+        # vvla.use_cuda_graph: true (default) | false (eager python loop).
+        self._use_cuda_graph = bool(vv.get("use_cuda_graph", True))
+        self._sde_graphs: dict = {}
+
         self.logger = get_logger()
         self.global_step = 0
         self._warned_unexpected_keys: set = set()
@@ -531,6 +545,36 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
             :, : self.config.action_chunk, : self.config.action_env_dim
         ].to(torch.float32)
 
+    def _get_sde_graph(self, bsize, num_steps, prefix, device):
+        """Lazily capture (and cache) the vvla SDE loop graph for this batch
+        size; returns None when the graph path is unavailable (CPU, disabled,
+        or the policy does not support capture) — callers fall back to the
+        eager python loop."""
+        if (
+            not self._use_cuda_graph
+            or device.type != "cuda"
+            or not getattr(self.vvla_policy, "supports_cuda_graph", False)
+        ):
+            return None
+        key = (bsize, num_steps)
+        if key not in self._sde_graphs:
+            from vvla.engine.graph import SdeLoopGraph
+
+            self._sde_graphs[key] = SdeLoopGraph(
+                self.vvla_policy,
+                bsize,
+                device,
+                torch.float32,  # flow state / chains dtype (openpi convention)
+                num_steps,
+                prefix_dtype=prefix.kv[0][0].dtype,  # bf16 KV under bf16 towers
+                # RL flow-state shape (openpi horizon), not the checkpoint chunk
+                action_shape=(self.config.action_horizon, self.config.action_dim),
+            )
+            self.logger.info(
+                f"[vvla] captured SDE loop graph for batch={bsize}, num_steps={num_steps}"
+            )
+        return self._sde_graphs[key]
+
     @torch.no_grad()
     def _sample_actions_vvla(self, batch, mode="train", compute_values=True):
         """Prefix once + vvla SDE loop; returns the openpi ``sample_actions``
@@ -573,22 +617,30 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
             self._get_noise_level(device=torch.device("cpu"), dtype=torch.float32)
         )
         sigma_fn = self._make_sigma_schedule(sde_step, num_steps, noise_level)
-        # vvla owns the loop; with the openpi mean hook the realized transitions
-        # are exactly openpi's mixed ODE-SDE kernel. The [B, num_steps] per-step
-        # logprobs vvla returns are summed over all dims, so they are discarded —
-        # prev_logprobs needs the elementwise openpi convention, computed below
-        # from the sampler-recorded per-step velocities (no extra forward).
-        actions, _vvla_logprob, chains, velocities = flow_sample_with_logprob(
-            self.vvla_policy,
-            prefix,
-            x0,
-            num_steps,
-            sigma=sigma_fn,
-            return_trajectory=True,
-            per_step=True,
-            mean_fn=_openpi_flow_sde_mean,
-            return_velocities=True,
-        )
+        # vvla owns the loop; with the openpi mean hook / coefficient form the
+        # realized transitions are exactly openpi's mixed ODE-SDE kernel. The
+        # per-step logprobs vvla's eager sampler returns are summed over all
+        # dims, so they are discarded — prev_logprobs needs the elementwise
+        # openpi convention, computed below from the sampler-recorded per-step
+        # velocities (no extra forward).
+        graph = self._get_sde_graph(bsize, num_steps, prefix, device)
+        if graph is not None:
+            sigmas = [
+                sigma_fn(t) for t, _ in self.vvla_policy.flow_schedule(num_steps)
+            ]
+            actions, chains, velocities = graph.sample(prefix, x0, sigmas)
+        else:
+            actions, _vvla_logprob, chains, velocities = flow_sample_with_logprob(
+                self.vvla_policy,
+                prefix,
+                x0,
+                num_steps,
+                sigma=sigma_fn,
+                return_trajectory=True,
+                per_step=True,
+                mean_fn=_openpi_flow_sde_mean,
+                return_velocities=True,
+            )
 
         if sde_step is not None:
             prev_logprobs = self._openpi_step_logprob(
