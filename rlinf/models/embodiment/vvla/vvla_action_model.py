@@ -489,8 +489,12 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
                 # float inputs are already in [-1, 1] (openpi convention)
                 img = img.to(image_dtype)
             if img.shape[-1] == 3:  # HWC -> CHW
+                # Keep the permuted VIEW (channels-last strides) — the exact
+                # layout openpi feeds its vision tower. Forcing NCHW-contiguous
+                # here costs ~30% of the SigLIP forward at B=32 (cudnn picks
+                # NHWC tensor-core conv kernels for channels-last input).
                 img = img.permute(0, 3, 1, 2)
-            images.append(img.contiguous())
+            images.append(img)
             img_masks.append(mask_dict[cam].reshape(img.shape[0]).bool())
         tokens = processed_obs["tokenized_prompt"].long()
         masks = processed_obs["tokenized_prompt_mask"].bool()
