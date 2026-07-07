@@ -664,5 +664,10 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
 
 
 def get_model(cfg, torch_dtype=None):
+    # Match the numerics regime of the native rollout: openpi's PI0Pytorch
+    # enables TF32 matmuls globally in its __init__; without this the vvla
+    # rollout runs true-fp32 matmuls (~4x slower on tensor-core GPUs), which
+    # would skew any speed comparison and differ from the actor's regime.
+    torch.set_float32_matmul_precision("high")
     model = VvlaForRLActionPrediction(cfg)
     return model.eval()
