@@ -142,15 +142,52 @@ def _openpi_flow_sde_sigma(t_val: float, num_steps: int, noise_level: float) -> 
     return noise_level * math.sqrt(t_val / denom)
 
 
+# openpi's PaliGemmaWithExpertModel.to_bfloat16_for_selected_params keep-fp32
+# list, verbatim: everything else in the backbone (both Gemma towers, the
+# SigLIP encoder, the projector, embed_tokens/lm_head) is cast to bf16; the
+# vision patch/position embeddings and every text-tower RMSNorm stay fp32.
+# Substring matching over parameter names works identically on the lerobot
+# tree (same submodule names under paligemma_with_expert).
+_OPENPI_KEEP_FP32_SELECTORS = (
+    "vision_tower.vision_model.embeddings.patch_embedding.weight",
+    "vision_tower.vision_model.embeddings.patch_embedding.bias",
+    "vision_tower.vision_model.embeddings.position_embedding.weight",
+    "input_layernorm",
+    "post_attention_layernorm",
+    "model.norm",
+)
+
+
+def _cast_backbone_bf16_openpi(pwe: nn.Module) -> None:
+    """Replicate openpi's selective bf16 cast on the lerobot backbone tree.
+
+    Mirrors ``to_bfloat16_for_selected_params("bfloat16")``, which the native
+    openpi rollout applies to ``paligemma_with_expert`` only — the flow-side
+    modules outside it (action_in/out_proj, time_mlp_*, state_proj) and the
+    value head stay fp32 on both sides, so weight-sync dtypes match key-by-key.
+    """
+    pwe.to(dtype=torch.bfloat16)
+    for name, param in pwe.named_parameters():
+        if any(sel in name for sel in _OPENPI_KEEP_FP32_SELECTORS):
+            param.data = param.data.to(dtype=torch.float32)
+
+
 def _install_embed_image_shim(lerobot_policy) -> None:
     """Make lerobot's PaliGemmaWithExpert.embed_image work under either a stock
     or an openpi-patched transformers install (see module docstring)."""
     pwe = lerobot_policy.model.paligemma_with_expert
     pg_model = pwe.paligemma.model
     hidden_scale = pwe.paligemma.config.text_config.hidden_size**0.5
+    tok_embed = pg_model.language_model.embed_tokens
 
     def embed_image(image: torch.Tensor):
-        out_dtype = image.dtype
+        # Feed the vision tower fp32 pixels (openpi convention: images stay
+        # fp32 into the fp32 patch embedding; the patched SigLIP encoder
+        # handles its own internal precision), and hand the features back in
+        # the language-embedding dtype so lerobot's embed_prefix concatenates
+        # them with the (possibly bf16) token embeddings — the same effective
+        # dtype the native openpi embed_prefix produces. fp32 tree: no-ops.
+        out_dtype = tok_embed.weight.dtype
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
         feats = pg_model.get_image_features(image)
@@ -311,6 +348,15 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
         base_cfg = PreTrainedConfig.from_pretrained(vv.get("base_config_path"))
         lerobot_policy = PI05Policy(base_cfg)
         _load_sft_weights(lerobot_policy, cfg.model_path)
+        # Match the native rollout's precision regime: openpi's builder applies
+        # to_bfloat16_for_selected_params("bfloat16") to the backbone after
+        # loading. vvla.precision: "bfloat16" (default, actor-identical) or
+        # "float32" (full-fp32 fallback for precision-regression comparisons).
+        precision = vv.get("precision", "bfloat16")
+        if precision == "bfloat16":
+            _cast_backbone_bf16_openpi(lerobot_policy.model.paligemma_with_expert)
+        elif precision != "float32":
+            raise ValueError(f"vvla.precision must be 'bfloat16' or 'float32', got '{precision}'")
         _install_embed_image_shim(lerobot_policy)
         # registered as a submodule so weight sync sees real parameters
         self.model = lerobot_policy.model
@@ -414,16 +460,20 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
         """
         from vvla.policies.pi05.processor_pi05 import Pi05Batch
 
-        model_dtype = next(self.parameters()).dtype
+        # Images stay fp32 regardless of the backbone precision — openpi's
+        # Observation.from_dict produces fp32 [-1, 1] pixels and feeds them to
+        # the (fp32) vision patch embedding; the bf16 handoff happens inside
+        # the tower / at the embed_image boundary (see the shim).
+        image_dtype = torch.float32
         image_dict = processed_obs["image"]
         mask_dict = processed_obs["image_mask"]
         images, img_masks = [], []
         for cam, img in image_dict.items():
             if img.dtype == torch.uint8:
-                img = img.to(model_dtype) / 255.0 * 2.0 - 1.0
-            elif img.dtype != model_dtype:
+                img = img.to(image_dtype) / 255.0 * 2.0 - 1.0
+            elif img.dtype != image_dtype:
                 # float inputs are already in [-1, 1] (openpi convention)
-                img = img.to(model_dtype)
+                img = img.to(image_dtype)
             if img.shape[-1] == 3:  # HWC -> CHW
                 img = img.permute(0, 3, 1, 2)
             images.append(img.contiguous())
@@ -449,23 +499,21 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
 
         return sigma
 
-    def _openpi_step_logprob(self, chains, sde_step, num_steps, noise_level, prefix):
+    def _openpi_step_logprob(self, chains, v, sde_step, num_steps, noise_level):
         """Elementwise transition logprob of the selected step, in the exact
         openpi flow_sde convention (the actor's ``sample_mean_var_val`` +
         ``get_logprob_norm`` on the same ``(x_j, x_{j+1})``), so the PPO ratio
         at theta == theta_behavior is exactly 1.
 
-        One extra ``denoise_step`` call recovers v(x_j, t_j) (the trajectory
-        stores states only); cost is 1/N of the sampling loop.
+        ``v`` is the sampler-recorded velocity ``v(x_j, t_j)`` at the selected
+        step (``flow_sample_with_logprob(..., return_velocities=True)``) — the
+        very tensor the realized transition used, so no extra ``denoise_step``
+        forward is needed.
         """
-        bsize = chains.shape[0]
-        device = chains.device
         t_val, dt = self.vvla_policy.flow_schedule(num_steps)[sde_step]
         delta = abs(dt)
         x_j = chains[:, sde_step]
         x_next = chains[:, sde_step + 1]
-        t = torch.full((bsize,), t_val, device=device, dtype=x_j.dtype)
-        v = self.vvla_policy.denoise_step(x_j, t, prefix)
 
         sigma_j = _openpi_flow_sde_sigma(t_val, num_steps, noise_level)
         std = sigma_j * math.sqrt(delta)
@@ -490,8 +538,11 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
         denoise_inds."""
         from vvla.rollout.logprob import flow_sample_with_logprob
 
-        param = next(self.parameters())
-        device, dtype = param.device, param.dtype
+        device = next(self.parameters()).device
+        # x_t / chains / Euler integration run in fp32 (openpi convention:
+        # only the tower interiors run bf16; noise, time and the flow state
+        # stay fp32 under either backbone precision).
+        dtype = torch.float32
         bsize = batch.batch_size
         num_steps = self.config.num_steps
 
@@ -525,8 +576,9 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
         # vvla owns the loop; with the openpi mean hook the realized transitions
         # are exactly openpi's mixed ODE-SDE kernel. The [B, num_steps] per-step
         # logprobs vvla returns are summed over all dims, so they are discarded —
-        # prev_logprobs needs the elementwise openpi convention, recomputed below.
-        actions, _vvla_logprob, chains = flow_sample_with_logprob(
+        # prev_logprobs needs the elementwise openpi convention, computed below
+        # from the sampler-recorded per-step velocities (no extra forward).
+        actions, _vvla_logprob, chains, velocities = flow_sample_with_logprob(
             self.vvla_policy,
             prefix,
             x0,
@@ -535,11 +587,12 @@ class VvlaForRLActionPrediction(nn.Module, BasePolicy):
             return_trajectory=True,
             per_step=True,
             mean_fn=_openpi_flow_sde_mean,
+            return_velocities=True,
         )
 
         if sde_step is not None:
             prev_logprobs = self._openpi_step_logprob(
-                chains, sde_step, num_steps, noise_level, prefix
+                chains, velocities[:, sde_step], sde_step, num_steps, noise_level
             )
         else:
             # eval: openpi's ODE std is 0 and get_logprob_norm masks it to zeros
