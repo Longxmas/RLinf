@@ -137,6 +137,13 @@ class MultiStepRolloutWorker(Worker):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
 
+            # Allow a heterogeneous rollout backend (e.g. vvla serving
+            # generation while the actor trains the reference implementation).
+            if self.cfg.rollout.model.get("model_type") is not None:
+                rollout_model_config.model_type = self.cfg.rollout.model.model_type
+            if self.cfg.rollout.model.get("vvla") is not None:
+                rollout_model_config.vvla = self.cfg.rollout.model.vvla
+
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
