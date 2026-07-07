@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import os
 import multiprocessing
 import warnings
 from multiprocessing import connection
@@ -76,6 +78,54 @@ gym_new_venv_step_type = tuple[
 warnings.simplefilter("once", DeprecationWarning)
 
 
+def _enable_worker_faultlog() -> None:
+    """Dump the Python stack on fatal signals if RLINF_LIBERO_WORKER_FAULTLOG_DIR is set.
+
+    Spawned env workers lose their stderr, so a native crash (SIGSEGV/SIGABRT)
+    in the render stack is otherwise invisible to the parent, which only sees
+    an EOFError on the pipe.
+    """
+    log_dir = os.environ.get("RLINF_LIBERO_WORKER_FAULTLOG_DIR")
+    if not log_dir:
+        return
+    import faulthandler
+
+    os.makedirs(log_dir, exist_ok=True)
+    faulthandler.enable(
+        open(os.path.join(log_dir, f"worker_fault_{os.getpid()}.log"), "w")
+    )
+
+
+def _patch_mj_render_make_current() -> None:
+    """Make robosuite's MjRenderContext rebind its GL context before each render.
+
+    robosuite 1.4 makes the offscreen EGL context current only once, in
+    MjRenderContext.__init__. If the context is later unbound from the worker
+    thread (EGLGLContext.free() of a previous env after a "reconfigure" calls
+    eglReleaseThread(), which resets the thread's current context), subsequent
+    mjr_readPixels calls run without a bound GL context and abort inside the
+    driver, killing the worker with SIGABRT after the first reconfigure cycle.
+    Rebinding at the top of render() is cheap, makes rendering robust to any
+    such unbind, and turns a destroyed context into a catchable RuntimeError
+    instead of a native abort.
+    """
+    try:
+        from robosuite.utils import binding_utils as _bu
+    except Exception:
+        return
+    ctx_cls = _bu.MjRenderContext
+    if getattr(ctx_cls, "_rlinf_make_current_patched", False):
+        return
+    orig_render = ctx_cls.render
+
+    def render(self, *args, **kwargs):
+        self.gl_ctx.make_current()
+        return orig_render(self, *args, **kwargs)
+
+    ctx_cls.render = render
+    ctx_cls._rlinf_make_current_patched = True
+
+
 def _worker(
     parent: connection.Connection,
     p: connection.Connection,
@@ -96,6 +146,8 @@ def _worker(
         return None
 
     parent.close()
+    _enable_worker_faultlog()
+    _patch_mj_render_make_current()
     env = env_fn_wrapper.data()
     try:
         while True:
@@ -155,6 +207,9 @@ def _worker(
                 p.send(obs)
             elif cmd == "reconfigure":
                 env.close()
+                # Free the old env (and its GL/EGL render context) deterministically
+                # before creating the replacement env in this same process.
+                gc.collect()
                 seed = data.pop("seed")
                 env = OffScreenRenderEnv(**data)
                 env.seed(seed)
