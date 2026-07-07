@@ -235,6 +235,15 @@ class VvlaGr00tForRLActionPrediction(nn.Module, BasePolicy):
             self.action_head.value_head.to(torch.bfloat16)
             self.action_head.value_head._init_weights()
 
+        # ---- CUDA-graph SDE loop (vvla engine) --------------------------------
+        # Same integration as the pi0.5 adapter: the whole N-step denoise loop
+        # is captured once per (batch, num_steps) and replayed per rollout call
+        # (vvla SdeLoopGraph, GR00T orientation auto-derived from the policy's
+        # forward-time flow_schedule). Weight sync stays valid because both
+        # RLinf syncers update parameters in-place.
+        self._use_cuda_graph = bool(vv.get("use_cuda_graph", True))
+        self._sde_graphs: dict = {}
+
         self.global_step = 0
 
     # ---- reused native helpers (unbound-method delegation) --------------------
@@ -356,6 +365,50 @@ class VvlaGr00tForRLActionPrediction(nn.Module, BasePolicy):
             :, :, : self.action_chunk, : self.env_action_dim
         ]
 
+    def _get_sde_graph(self, bsize, num_steps, prefix, device):
+        """Lazily capture (and cache) the vvla SDE loop graph for this batch
+        size; returns None when the graph path is unavailable (CPU, disabled,
+        or the policy does not support capture) — callers fall back to the
+        eager python loop."""
+        if (
+            not self._use_cuda_graph
+            or device.type != "cuda"
+            or not getattr(self.vvla_policy, "supports_cuda_graph", False)
+        ):
+            return None
+        # A captured graph references the parameter storages of capture time.
+        # If the worker offloaded the model to CPU and back (rollout
+        # enable_offload), every parameter was reallocated and all cached
+        # graphs point at freed memory — detect the move via an anchor
+        # parameter's data_ptr and re-capture. (Prefer enable_offload: False
+        # on the rollout side; this guard makes offload correct, at a
+        # re-capture cost per onload.)
+        anchor_ptr = next(self.action_head.parameters()).data_ptr()
+        if self._sde_graphs and self._sde_graphs.get("_anchor") != anchor_ptr:
+            if "_anchor" in self._sde_graphs:
+                self.logger.warning(
+                    "[vvla_gr00t] parameter storages moved (offload?); re-capturing SDE graphs"
+                )
+            self._sde_graphs.clear()
+        key = (bsize, num_steps)
+        if key not in self._sde_graphs:
+            from vvla.engine.graph import SdeLoopGraph
+
+            self._sde_graphs[key] = SdeLoopGraph(
+                self.vvla_policy,
+                bsize,
+                device,
+                prefix.vl_embeds.dtype,  # GR00T flow state runs in bf16
+                num_steps,
+                prefix_dtype=prefix.vl_embeds.dtype,
+                action_shape=(self.action_horizon, self.model_action_dim),
+            )
+            self._sde_graphs["_anchor"] = anchor_ptr
+            self.logger.info(
+                f"[vvla_gr00t] captured SDE loop graph for batch={bsize}, num_steps={num_steps}"
+            )
+        return self._sde_graphs[key]
+
     @torch.no_grad()
     def _sample_actions_vvla(self, normalized_input, mode="train"):
         from vvla.policies.gr00t.processor_gr00t import Gr00tBatch
@@ -401,17 +454,24 @@ class VvlaGr00tForRLActionPrediction(nn.Module, BasePolicy):
 
         noise_level = float(self.rl_config.get("noise_level", 0.5))
         sigma_fn = self._make_sigma_schedule(sde_step, num_steps, noise_level)
-        actions, _lp, chains, velocities = flow_sample_with_logprob(
-            self.vvla_policy,
-            prefix,
-            x0,
-            num_steps,
-            sigma=sigma_fn,
-            return_trajectory=True,
-            per_step=True,
-            mean_fn=_gr00t_flow_sde_mean,
-            return_velocities=True,
-        )
+        graph = self._get_sde_graph(bsize, num_steps, prefix, device)
+        if graph is not None:
+            sigmas = [
+                sigma_fn(t) for t, _ in self.vvla_policy.flow_schedule(num_steps)
+            ]
+            actions, chains, velocities = graph.sample(prefix, x0, sigmas)
+        else:
+            actions, _lp, chains, velocities = flow_sample_with_logprob(
+                self.vvla_policy,
+                prefix,
+                x0,
+                num_steps,
+                sigma=sigma_fn,
+                return_trajectory=True,
+                per_step=True,
+                mean_fn=_gr00t_flow_sde_mean,
+                return_velocities=True,
+            )
 
         prev_logprobs = self._per_step_logprobs(
             chains, velocities, sde_step, num_steps, noise_level
