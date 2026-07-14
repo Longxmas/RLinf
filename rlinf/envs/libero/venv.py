@@ -94,6 +94,11 @@ def _enable_worker_faultlog() -> None:
     faulthandler.enable(
         open(os.path.join(log_dir, f"worker_fault_{os.getpid()}.log"), "w")
     )
+    import sys
+
+    _err = open(os.path.join(log_dir, f"worker_stderr_{os.getpid()}.log"), "w")
+    os.dup2(_err.fileno(), 2)
+    sys.stderr = os.fdopen(2, "w", buffering=1)
 
 
 def _patch_mj_render_make_current() -> None:
