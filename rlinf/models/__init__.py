@@ -72,6 +72,11 @@ def _register_builtin_models():
         return get_model(cfg, torch_dtype)
 
 
+    def _build_vvla_openvla_oft(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.vvla.vvla_openvla_oft_action_model import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_dexbotic_pi(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.dexbotic_pi import get_model
 
@@ -179,6 +184,12 @@ def _register_builtin_models():
     register_model(
         "vvla_gr00t",
         _build_vvla_gr00t,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        "vvla_openvla_oft",
+        _build_vvla_openvla_oft,
         category="embodied",
         force=True,
     )
